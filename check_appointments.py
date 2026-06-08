@@ -1,5 +1,4 @@
 import asyncio
-import hashlib
 import os
 import time
 from playwright.async_api import async_playwright
@@ -12,10 +11,26 @@ URL = (
     "?departement=&motif_name_with_location_type=renouvellement_de_recepisses_arrives_a_echeance_-public_office"
     "&public_link_organisation_id=2458"
 )
+
 STATE_FILE = "state.txt"
 HEARTBEAT_FILE = "last_heartbeat.txt"
-HEARTBEAT_HOURS = 0.08  # ~5 minutes — for testing only, change back to 24 when done
+ERROR_FILE = "last_error.txt"
 
+# How often to send the "still alive, no slots" heartbeat
+HEARTBEAT_HOURS = 6
+
+# How often to re-send an error alert if the issue continues
+ERROR_NOTIFY_HOURS = 1
+
+# Phrase shown by the page when no slots are available
+NO_SLOT_PHRASE = "aucun créneau correspondant à votre recherche n'a été trouvé"
+
+# Phrase that should ALWAYS appear on the page if it loaded correctly.
+# If missing → the page didn't load correctly (blocked, captcha, layout change, etc.)
+PAGE_ANCHOR_PHRASE = "renouvellement de récépissés"
+
+
+# ---------- Telegram ----------
 
 async def send_telegram(message: str) -> None:
     async with httpx.AsyncClient() as client:
@@ -26,6 +41,8 @@ async def send_telegram(message: str) -> None:
         )
         r.raise_for_status()
 
+
+# ---------- Page fetch ----------
 
 async def fetch_page_text() -> str:
     async with async_playwright() as p:
@@ -46,42 +63,77 @@ async def fetch_page_text() -> str:
     return text
 
 
-def read_state() -> str:
+# ---------- State helpers ----------
+
+def _read(path: str) -> str:
     try:
-        return open(STATE_FILE).read().strip()
+        return open(path).read().strip()
     except FileNotFoundError:
         return ""
 
 
-def write_state(h: str) -> None:
-    with open(STATE_FILE, "w") as f:
-        f.write(h)
+def _write(path: str, value: str) -> None:
+    with open(path, "w") as f:
+        f.write(value)
 
 
-def read_last_heartbeat() -> float:
+def read_state() -> str:
+    return _read(STATE_FILE)
+
+
+def write_state(v: str) -> None:
+    _write(STATE_FILE, v)
+
+
+def read_last_ts(path: str) -> float:
     try:
-        return float(open(HEARTBEAT_FILE).read().strip())
-    except (FileNotFoundError, ValueError):
+        return float(_read(path))
+    except ValueError:
         return 0.0
 
 
-def write_heartbeat() -> None:
-    with open(HEARTBEAT_FILE, "w") as f:
-        f.write(str(time.time()))
+def write_ts(path: str) -> None:
+    _write(path, str(time.time()))
 
 
-def heartbeat_due() -> bool:
-    elapsed_hours = (time.time() - read_last_heartbeat()) / 3600
-    return elapsed_hours >= HEARTBEAT_HOURS
+def hours_since(path: str) -> float:
+    return (time.time() - read_last_ts(path)) / 3600
 
 
-# Exact phrase shown by the page when no slots are available
-NO_SLOT_PHRASE = "aucun créneau correspondant à votre recherche n'a été trouvé"
+def format_hours(h: float) -> str:
+    if h >= 1:
+        return f"{int(round(h))}h"
+    return f"{int(round(h * 60))}min"
 
+
+# ---------- Page analysis ----------
 
 def has_no_slots(text: str) -> bool:
     return NO_SLOT_PHRASE in text.lower()
 
+
+def page_loaded_correctly(text: str) -> bool:
+    return PAGE_ANCHOR_PHRASE in text.lower()
+
+
+# ---------- Error notification (rate-limited) ----------
+
+async def notify_error(reason: str) -> None:
+    if hours_since(ERROR_FILE) < ERROR_NOTIFY_HOURS:
+        print(f"Error suppressed (rate-limited): {reason}")
+        return
+    await send_telegram(
+        "⚠️ <b>Problème détecté</b>\n\n"
+        f"Le bot n'arrive pas à surveiller la page correctement.\n\n"
+        f"<b>Raison :</b> {reason}\n\n"
+        f"Vérifie manuellement et le serveur si besoin.\n"
+        f"👉 <a href='{URL}'>Ouvrir la page</a>"
+    )
+    write_ts(ERROR_FILE)
+    print(f"Error notification sent: {reason}")
+
+
+# ---------- Main ----------
 
 async def main() -> None:
     print("Fetching page...")
@@ -89,36 +141,49 @@ async def main() -> None:
         text = await fetch_page_text()
     except Exception as e:
         print(f"Failed to fetch page: {e}")
+        await notify_error(f"Impossible de charger la page : {type(e).__name__}")
         return
+
+    # Sanity check — did the page load correctly?
+    if not page_loaded_correctly(text):
+        snippet = text[:200].replace("\n", " ")
+        print(f"Unexpected page content. First 200 chars: {snippet}")
+        await notify_error(
+            "La page ne contient pas le contenu attendu. "
+            "Peut-être un blocage, captcha, ou changement du site."
+        )
+        return
+
+    # Page loaded fine → clear any previous error timer so next error notifies immediately
+    if read_last_ts(ERROR_FILE) > 0:
+        _write(ERROR_FILE, "0")
 
     no_slots = has_no_slots(text)
     print(f"Slots available: {not no_slots}")
 
-    # We only care about slot availability — ignore other page changes
-    # State stores "NO_SLOTS" or "SLOTS_AVAILABLE"
     current_state = "NO_SLOTS" if no_slots else "SLOTS_AVAILABLE"
     previous_state = read_state()
-
     print(f"prev={previous_state or 'none'} curr={current_state}")
 
+    # --- Case 1: nothing changed ---
     if current_state == previous_state:
         print("No change in slot availability.")
-        # Even with no change, send a daily heartbeat if no slots
-        if current_state == "NO_SLOTS" and heartbeat_due():
+        if current_state == "NO_SLOTS" and hours_since(HEARTBEAT_FILE) >= HEARTBEAT_HOURS:
             await send_telegram(
                 "🔴 <b>Toujours aucun créneau disponible</b>\n\n"
-                "Le bot surveille la page et il n'y a pas encore de rendez-vous.\n"
-                f"📅 Prochain rapport dans {HEARTBEAT_HOURS}h\n\n"
+                "Le bot fonctionne bien et surveille la page.\n"
+                f"📅 Prochain rapport dans {format_hours(HEARTBEAT_HOURS)}\n\n"
                 f"👉 <a href='{URL}'>Vérifier manuellement</a>"
             )
-            write_heartbeat()
+            write_ts(HEARTBEAT_FILE)
             print("Heartbeat sent.")
         return
 
+    # --- Case 2: state changed ---
     write_state(current_state)
+    write_ts(HEARTBEAT_FILE)
 
     if current_state == "SLOTS_AVAILABLE":
-        write_heartbeat()  # reset heartbeat timer when slots appear
         await send_telegram(
             "🟢 <b>Créneaux disponibles !</b>\n\n"
             "Des créneaux sont disponibles pour le <b>renouvellement de récépissé</b>.\n\n"
@@ -127,8 +192,6 @@ async def main() -> None:
         )
         print("Slots appeared — notification sent!")
     else:
-        # Slots disappeared (were available, now gone)
-        write_heartbeat()
         await send_telegram(
             "🔴 <b>Les créneaux sont repartis</b>\n\n"
             "Il n'y a plus de créneaux disponibles. Le bot continue de surveiller.\n\n"
