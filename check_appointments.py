@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import os
+import time
 from playwright.async_api import async_playwright
 import httpx
 
@@ -12,6 +13,8 @@ URL = (
     "&public_link_organisation_id=2458"
 )
 STATE_FILE = "state.txt"
+HEARTBEAT_FILE = "last_heartbeat.txt"
+HEARTBEAT_HOURS = 0.08  # ~5 minutes — for testing only, change back to 24 when done
 
 
 async def send_telegram(message: str) -> None:
@@ -55,6 +58,23 @@ def write_state(h: str) -> None:
         f.write(h)
 
 
+def read_last_heartbeat() -> float:
+    try:
+        return float(open(HEARTBEAT_FILE).read().strip())
+    except (FileNotFoundError, ValueError):
+        return 0.0
+
+
+def write_heartbeat() -> None:
+    with open(HEARTBEAT_FILE, "w") as f:
+        f.write(str(time.time()))
+
+
+def heartbeat_due() -> bool:
+    elapsed_hours = (time.time() - read_last_heartbeat()) / 3600
+    return elapsed_hours >= HEARTBEAT_HOURS
+
+
 # Exact phrase shown by the page when no slots are available
 NO_SLOT_PHRASE = "aucun créneau correspondant à votre recherche n'a été trouvé"
 
@@ -83,11 +103,22 @@ async def main() -> None:
 
     if current_state == previous_state:
         print("No change in slot availability.")
+        # Even with no change, send a daily heartbeat if no slots
+        if current_state == "NO_SLOTS" and heartbeat_due():
+            await send_telegram(
+                "🔴 <b>Toujours aucun créneau disponible</b>\n\n"
+                "Le bot surveille la page et il n'y a pas encore de rendez-vous.\n"
+                f"📅 Prochain rapport dans {HEARTBEAT_HOURS}h\n\n"
+                f"👉 <a href='{URL}'>Vérifier manuellement</a>"
+            )
+            write_heartbeat()
+            print("Heartbeat sent.")
         return
 
     write_state(current_state)
 
     if current_state == "SLOTS_AVAILABLE":
+        write_heartbeat()  # reset heartbeat timer when slots appear
         await send_telegram(
             "🟢 <b>Créneaux disponibles !</b>\n\n"
             "Des créneaux sont disponibles pour le <b>renouvellement de récépissé</b>.\n\n"
@@ -96,8 +127,14 @@ async def main() -> None:
         )
         print("Slots appeared — notification sent!")
     else:
-        # Slots disappeared (were available, now gone) — silent, no notification needed
-        print("Slots are gone again. Monitoring continues.")
+        # Slots disappeared (were available, now gone)
+        write_heartbeat()
+        await send_telegram(
+            "🔴 <b>Les créneaux sont repartis</b>\n\n"
+            "Il n'y a plus de créneaux disponibles. Le bot continue de surveiller.\n\n"
+            f"👉 <a href='{URL}'>Vérifier quand même</a>"
+        )
+        print("Slots gone — notification sent.")
 
 
 if __name__ == "__main__":
