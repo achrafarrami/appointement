@@ -55,18 +55,12 @@ def write_state(h: str) -> None:
         f.write(h)
 
 
-NO_SLOT_PHRASES = [
-    "aucun créneau",
-    "aucun rendez-vous",
-    "pas de créneau",
-    "aucune disponibilité",
-    "no slot available",
-]
+# Exact phrase shown by the page when no slots are available
+NO_SLOT_PHRASE = "aucun créneau correspondant à votre recherche n'a été trouvé"
 
 
-def slots_likely(text: str) -> bool:
-    lower = text.lower()
-    return not any(phrase in lower for phrase in NO_SLOT_PHRASES)
+def has_no_slots(text: str) -> bool:
+    return NO_SLOT_PHRASE in text.lower()
 
 
 async def main() -> None:
@@ -77,45 +71,33 @@ async def main() -> None:
         print(f"Failed to fetch page: {e}")
         return
 
-    current = hashlib.sha256(text.encode()).hexdigest()
-    previous = read_state()
-    first_run = previous == ""
+    no_slots = has_no_slots(text)
+    print(f"Slots available: {not no_slots}")
 
-    print(f"prev={previous[:8] or 'none'} curr={current[:8]} changed={current != previous}")
+    # We only care about slot availability — ignore other page changes
+    # State stores "NO_SLOTS" or "SLOTS_AVAILABLE"
+    current_state = "NO_SLOTS" if no_slots else "SLOTS_AVAILABLE"
+    previous_state = read_state()
 
-    if not first_run and current == previous:
-        print("No change detected.")
+    print(f"prev={previous_state or 'none'} curr={current_state}")
+
+    if current_state == previous_state:
+        print("No change in slot availability.")
         return
 
-    write_state(current)
+    write_state(current_state)
 
-    if first_run:
-        if slots_likely(text):
-            await send_telegram(
-                "🟢 <b>Créneaux disponibles !</b>\n\n"
-                "Des créneaux semblent disponibles dès maintenant.\n"
-                f"👉 <a href='{URL}'>Réserver maintenant</a>"
-            )
-            print("Slots found on first run — notification sent.")
-        else:
-            print("First run complete, no slots yet. Monitoring started.")
-        return
-
-    if slots_likely(text):
-        msg = (
-            "🟢 <b>Nouveaux créneaux disponibles !</b>\n\n"
-            "La page a changé et des créneaux semblent disponibles.\n"
-            f"👉 <a href='{URL}'>Réserver maintenant</a>"
+    if current_state == "SLOTS_AVAILABLE":
+        await send_telegram(
+            "🟢 <b>Créneaux disponibles !</b>\n\n"
+            "Des créneaux sont disponibles pour le <b>renouvellement de récépissé</b>.\n\n"
+            "⚡ Réservez vite, ça part rapidement !\n\n"
+            f"👉 <a href='{URL}'>Prendre rendez-vous</a>"
         )
+        print("Slots appeared — notification sent!")
     else:
-        msg = (
-            "🔄 <b>Page modifiée</b>\n\n"
-            "La page a changé (mais aucun créneau évident détecté).\n"
-            f"👉 <a href='{URL}'>Vérifier quand même</a>"
-        )
-
-    await send_telegram(msg)
-    print("Notification sent.")
+        # Slots disappeared (were available, now gone) — silent, no notification needed
+        print("Slots are gone again. Monitoring continues.")
 
 
 if __name__ == "__main__":
