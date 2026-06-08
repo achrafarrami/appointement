@@ -1,8 +1,20 @@
 import asyncio
 import os
+import sys
 import time
+from datetime import datetime
 from playwright.async_api import async_playwright
 import httpx
+
+
+# Replace print() with a timestamped version (and force flush so tail -f shows it instantly)
+_original_print = print
+
+
+def print(*args, **kwargs):  # noqa: A001
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    _original_print(f"[{ts}]", *args, **kwargs, flush=True)
+    sys.stdout.flush()
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
@@ -136,6 +148,7 @@ async def notify_error(reason: str) -> None:
 # ---------- Main ----------
 
 async def main() -> None:
+    print("===== RUN START =====")
     print("Fetching page...")
     try:
         text = await fetch_page_text()
@@ -201,4 +214,9 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    start = time.time()
+    try:
+        asyncio.run(main())
+    finally:
+        duration = time.time() - start
+        print(f"===== RUN END (took {duration:.1f}s) =====\n")
